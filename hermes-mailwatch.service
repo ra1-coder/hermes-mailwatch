@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes mail watcher (IMAP IDLE, model wakes on mail only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# User=<hermes runtime user>
+ExecStart=/usr/bin/python3 /opt/hermes/hermes_mailwatch.py
+EnvironmentFile=/opt/hermes/.env
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
