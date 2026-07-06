@@ -124,7 +124,9 @@ def normalize(raw):
     from_name, from_addr = email.utils.parseaddr(msg.get("From", ""))
     from_addr = from_addr.lower()
     auth = " ".join(msg.get_all("Authentication-Results", []) or []).lower()
-    dkim_ok = "dkim=pass" in auth or "spf=pass" in auth
+    # Authority requires DKIM specifically: SPF authenticates the sending
+    # server, not the From header, and must never grant principal status.
+    dkim_ok = re.search(r"\bdkim=pass\b", auth) is not None
     try:
         received_at = email.utils.parsedate_to_datetime(msg.get("Date")).isoformat()
     except Exception:

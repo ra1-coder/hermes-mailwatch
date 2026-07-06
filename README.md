@@ -3,6 +3,9 @@
 Real-time inbox daemon (IMAP IDLE, 60s-poll fallback). Design contract:
 the transport is dumb and free; the model is invoked only when mail exists.
 Everyone gets read; only the verified principal gets obeyed.
+Authority requires a DKIM pass on the principal address specifically —
+SPF alone is never sufficient. (Check hardened after review by the
+Hermes agent itself, 06 Jul 2026.)
 
 Install (as root or the hermes user):
 
