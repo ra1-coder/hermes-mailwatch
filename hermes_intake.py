@@ -36,6 +36,12 @@ Use as a library (import hermes_intake) or as a CLI:
   # 5) store a file permanently (returns storage path for raw_json/metadata)
   python3 hermes_intake.py upload --file /path/to/report.pdf
 
+  Valid vocabularies (schema truth — do not guess, do not infer from examples):
+    sources:        telegram | gmail | calendar | pwa | file | web
+    relationships:  mentions | belongs_to | supersedes | caused_by | assigned_to | derived_from
+    entity types:   person | company | project | asset | place | product | account
+    desks:          front_desk | concierge | trip_radar | war_room | workshop
+
   # 6) propose/link entities (exact + alias match only; never guess)
   python3 hermes_intake.py entity-find --name "Christer"
   python3 hermes_intake.py entity-add --type person --name "Christer" --alias "christer@..."
