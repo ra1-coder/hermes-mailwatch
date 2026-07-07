@@ -218,7 +218,11 @@ def download_url(key, expires=3600):
 def entity_find(name):
     n = urllib.parse.quote(name)
     exact = _req("GET", f"/rest/v1/entities?select=*&canonical_name=ilike.{n}") or []
-    alias = _req("GET", f"/rest/v1/entities?select=*&aliases=cs.{{{json.dumps(name)}}}") or []
+    alias = _req(
+        "GET",
+        "/rest/v1/entities?select=*&aliases=cs."
+        + urllib.parse.quote("{" + json.dumps(name) + "}", safe=""),
+    ) or []
     seen, out = set(), []
     for e in exact + alias:
         if e["id"] not in seen:
