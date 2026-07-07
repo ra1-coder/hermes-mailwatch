@@ -26,6 +26,13 @@ the artifact points back to its origin. If the same real-world thing arrived
 twice (capture reports `possible_twins`), I make ONE artifact and link it to
 BOTH events — never two artifacts.
 
+## 3b. Deadlines become due dates
+
+If an input carries a date — "by Friday", "before the flight", an explicit
+deadline — the artifact gets `--due` in ISO 8601 with Manila offset. The
+control room's Today and Overdue views run on this field; a deadline left
+in prose is a deadline the system cannot see.
+
 ## 4. I always explain my routing
 
 After handling any event I run `mark` with a plain one-sentence note saying
@@ -58,6 +65,16 @@ Every calendar event I create must look like Ryan wrote it: "What — Who ·
 Where" titles, real venue in the location field, two-line description with
 a source line, honest durations, 1-hour reminder for anything outside the
 house. If it would look wrong next to Ryan's own entries, I rewrite it first.
+
+## 9. I file the day
+
+The 08:00 daily brief is not only sent to Telegram — it is ALSO filed as a
+brief-type artifact (status `done`) so the control room can print the
+morning's memo. General rule: reference material — briefs, dossiers,
+records of decisions already made — is filed `done`. Only items that still
+require action are filed `new`. An artifact filed `new` is a standing
+commitment on Ryan's board; I do not clutter his board with reading
+material.
 
 ## Precedence
 

@@ -153,9 +153,11 @@ def mark(event_id, status, note):
 # ————— artifacts born from events —————
 
 def artifact(a_type, title, body=None, desk="front_desk", status="new",
-             project=None, source_event=None, metadata=None, links=None):
+             project=None, source_event=None, metadata=None, links=None, due=None):
     row = {"type": a_type, "title": title, "body": body, "desk": desk,
            "status": status, "metadata": metadata or {}}
+    if due:
+        row["due_at"] = due  # ISO 8601; feeds Today (due 48h) and Inbox (overdue)
     if project:
         row["project_id"] = project
     if source_event:
@@ -253,6 +255,7 @@ def main():
     a.add_argument("--body"); a.add_argument("--desk", default="front_desk")
     a.add_argument("--status", default="new"); a.add_argument("--project")
     a.add_argument("--source-event"); a.add_argument("--metadata")
+    a.add_argument("--due", help="ISO 8601 deadline, e.g. 2026-07-10T18:00:00+08:00")
     a.add_argument("--link", action="append",
                    help="linked_type:uuid:relationship (e.g. entity:...:mentions)")
 
@@ -281,7 +284,8 @@ def main():
             t, i, r = l.split(":", 2); links.append((t, i, r))
         out = artifact(args.type, args.title, args.body, args.desk, args.status,
                        args.project, args.source_event,
-                       json.loads(args.metadata) if args.metadata else {}, links)
+                       json.loads(args.metadata) if args.metadata else {}, links,
+                       args.due)
     elif args.cmd == "search":
         out = search(args.q)
     elif args.cmd == "upload":
