@@ -31,7 +31,8 @@ import urllib.request
 PRINCIPAL_ADDR = "ryananthony.t@gmail.com"
 CATEGORIES = ["instruction", "action", "personal", "receipt", "news", "noise"]
 IDLE_MINUTES = 24  # re-issue IDLE before Gmail's ~29-minute cutoff
-BODY_LIMIT = 4000
+BODY_LIMIT = 4000      # stored in the database (capture first)
+TRIAGE_LIMIT = 2000    # sent to the model (category + one sentence needs no more)
 
 ENV = os.environ
 MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-haiku-4-5-20251001")
@@ -156,7 +157,7 @@ def triage(m):
         "\"summary\": \"one tight factual sentence\"}\n\n"
         "FROM: %s <%s>\nSUBJECT: %s\nVERIFIED_PRINCIPAL: %s\nBODY:\n%s"
         % (m["from_name"] or "", m["from_addr"], m["subject"] or "",
-           m["is_ryan"], m["body_text"][:BODY_LIMIT])
+           m["is_ryan"], m["body_text"][:TRIAGE_LIMIT])
     )
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -185,7 +186,7 @@ def triage(m):
         return cat, str(out.get("summary", ""))[:300]
     except Exception as e:
         log("triage failed (%s) — filing as action" % e)
-        return "action", (m["body_text"][:140] or m["subject"] or "").strip()
+        return "action", "[triage failed] " + (m["body_text"][:120] or m["subject"] or "").strip()
 
 
 # ---------- store + notify ----------
@@ -201,11 +202,16 @@ def store(m, category, summary):
             "Content-Type": "application/json",
             "apikey": ENV["SUPABASE_SERVICE_ROLE_KEY"],
             "Authorization": "Bearer " + ENV["SUPABASE_SERVICE_ROLE_KEY"],
-            "Prefer": "resolution=ignore-duplicates",
+            "Prefer": "resolution=ignore-duplicates,return=representation",
         },
     )
     with urllib.request.urlopen(req, timeout=30) as r:
-        return 200 <= r.status < 300
+        if not (200 <= r.status < 300):
+            return None
+        body = r.read().decode().strip()
+        # empty array => the unique message_id already existed (e.g. restart
+        # after a crash between store and marking Seen). Never ping twice.
+        return "duplicate" if body in ("", "[]") else "inserted"
 
 
 def telegram(text):
@@ -233,6 +239,9 @@ def handle_message(raw):
     ok = store(m, category, summary)
     if not ok:
         return False
+    if ok == "duplicate":
+        log("already filed, skipping ping | %s | %s" % (m["from_addr"], m["subject"]))
+        return True
     log("filed %s | %s | %s" % (category, m["from_addr"], m["subject"]))
     if category in ("instruction", "action"):
         tag = "INSTRUCTION" if category == "instruction" else "ACTION"
