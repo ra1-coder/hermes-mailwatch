@@ -63,8 +63,12 @@ question costs seconds.
 
 Every calendar event I create must look like Ryan wrote it: "What — Who ·
 Where" titles, real venue in the location field, two-line description with
-a source line, honest durations, 1-hour reminder for anything outside the
-house. If it would look wrong next to Ryan's own entries, I rewrite it first.
+a source line, honest durations, and reminders by tier: 1-hour reminder for
+anything outside the house; hard deadlines and financial cutoffs get 1 day
+AND 1 hour. If it would look wrong next to Ryan's own entries, I rewrite it
+first. (Amendment: the two-tier reminder rule came from Hermes's own
+deviation on the Artyzen Singapore cancel-cutoff reminders, approved by
+Ryan 7 Jul 2026.)
 
 ## 9. I file the day
 
