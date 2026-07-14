@@ -14,7 +14,7 @@ Stdlib only. Config via environment (see EnvironmentFile in the unit):
   GMAIL_USER, GMAIL_APP_PASSWORD,
   ANTHROPIC_API_KEY, HERMES_TRIAGE_MODEL (optional),
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID
 """
 import email
 import email.header
@@ -214,23 +214,22 @@ def store(m, category, summary):
         return "duplicate" if body in ("", "[]") else "inserted"
 
 
-def telegram(text):
-    tok, chat = ENV.get("TELEGRAM_BOT_TOKEN"), ENV.get("TELEGRAM_CHAT_ID")
-    if not tok or not chat:
+def discord(text):
+    tok = ENV.get("DISCORD_BOT_TOKEN")
+    chan = ENV.get("DISCORD_CHANNEL_ID", "1525050183312740384")
+    if not tok or not chan:
+        log("discord ping skipped: DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID not set")
         return
     req = urllib.request.Request(
-        "https://api.telegram.org/bot%s/sendMessage" % tok,
-        data=json.dumps({"chat_id": chat, "text": text, "parse_mode": "HTML"}).encode(),
-        headers={"Content-Type": "application/json"},
+        "https://discord.com/api/v10/channels/%s/messages" % chan,
+        data=json.dumps({"content": text[:1900]}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bot %s" % tok},
     )
     try:
         urllib.request.urlopen(req, timeout=30)
     except Exception as e:
-        log("telegram failed: %s" % e)
+        log("discord failed: %s" % e)
 
-
-def esc(s):
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def handle_message(raw):
@@ -245,14 +244,14 @@ def handle_message(raw):
     log("filed %s | %s | %s" % (category, m["from_addr"], m["subject"]))
     if category in ("instruction", "action"):
         tag = "INSTRUCTION" if category == "instruction" else "ACTION"
-        telegram(
-            "<b>POST · %s</b>\n<b>%s</b> — %s\n%s"
-            % (tag, esc(m["from_name"] or m["from_addr"]),
-               esc(m["subject"] or "(no subject)"), esc(summary))
+        discord(
+            "**POST · %s**\n**%s** — %s\n%s"
+            % (tag, m["from_name"] or m["from_addr"],
+               m["subject"] or "(no subject)", summary)
         )
     if category == "instruction":
         # HOOK(hermes): feed m["body_text"] into the agent loop here,
-        # exactly as if it were a Telegram message from Ryan.
+        # exactly as if it were a Discord message from Ryan.
         pass
     return True
 
