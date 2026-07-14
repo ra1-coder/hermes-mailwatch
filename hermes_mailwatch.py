@@ -223,7 +223,11 @@ def discord(text):
     req = urllib.request.Request(
         "https://discord.com/api/v10/channels/%s/messages" % chan,
         data=json.dumps({"content": text[:1900]}).encode(),
-        headers={"Content-Type": "application/json", "Authorization": "Bot %s" % tok},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bot %s" % tok,
+            "User-Agent": "DiscordBot (hermes-mailwatch, 1.0)",
+        },
     )
     try:
         urllib.request.urlopen(req, timeout=30)
