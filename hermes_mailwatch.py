@@ -107,7 +107,16 @@ def best_body(msg):
         elif ctype == "text/html" and htm is None:
             htm = text
     text = plain if plain is not None else html_to_text(htm or "")
-    # drop quoted thread + signature
+    # CAPTURE FIRST: store full fidelity — forwarded content and quoted
+    # threads are often the entire point of the email. Cleaning is a
+    # triage-time concern (see triage_view), never a storage-time one.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:BODY_LIMIT]
+
+
+def triage_view(text):
+    # For the model only: drop quoted thread + signature to save tokens,
+    # but keep forwarded content — it usually carries the payload.
     lines = []
     for line in text.splitlines():
         if line.startswith(">") or re.match(r"^On .{6,80} wrote:\s*$", line):
@@ -115,9 +124,7 @@ def best_body(msg):
         if line.strip() == "--":
             break
         lines.append(line)
-    text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:BODY_LIMIT]
+    return "\n".join(lines).strip() or text
 
 
 def normalize(raw):
@@ -132,12 +139,26 @@ def normalize(raw):
         received_at = email.utils.parsedate_to_datetime(msg.get("Date")).isoformat()
     except Exception:
         received_at = None
+    # Attachment awareness: the payload of an email is often a photo or a
+    # file, not text. Record what rode along so capture and triage know
+    # the words may not be the whole message.
+    attachments = []
+    for part in msg.walk():
+        fn = part.get_filename()
+        if fn:
+            attachments.append(decode_hdr(fn))
+        elif part.get_content_maintype() == "image":
+            attachments.append("inline-" + (part.get_content_subtype() or "image"))
+    body = best_body(msg)
+    if attachments:
+        body = (body + "\n\n[ATTACHMENTS: %s]" % ", ".join(attachments))[:BODY_LIMIT]
     return {
         "message_id": (msg.get("Message-ID") or "").strip() or None,
         "from_addr": from_addr or "unknown",
         "from_name": decode_hdr(from_name) or None,
         "subject": decode_hdr(msg.get("Subject", "")) or None,
-        "body_text": best_body(msg),
+        "body_text": body,
+        "attachments": attachments,
         "received_at": received_at,
         "is_ryan": from_addr == PRINCIPAL_ADDR and dkim_ok,
     }
@@ -157,7 +178,7 @@ def triage(m):
         "\"summary\": \"one tight factual sentence\"}\n\n"
         "FROM: %s <%s>\nSUBJECT: %s\nVERIFIED_PRINCIPAL: %s\nBODY:\n%s"
         % (m["from_name"] or "", m["from_addr"], m["subject"] or "",
-           m["is_ryan"], m["body_text"][:TRIAGE_LIMIT])
+           m["is_ryan"], triage_view(m["body_text"])[:TRIAGE_LIMIT])
     )
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -248,10 +269,11 @@ def handle_message(raw):
     log("filed %s | %s | %s" % (category, m["from_addr"], m["subject"]))
     if category in ("instruction", "action"):
         tag = "INSTRUCTION" if category == "instruction" else "ACTION"
+        att = "\n📎 " + ", ".join(m["attachments"]) if m.get("attachments") else ""
         discord(
-            "**POST · %s**\n**%s** — %s\n%s"
+            "**POST · %s**\n**%s** — %s\n%s%s"
             % (tag, m["from_name"] or m["from_addr"],
-               m["subject"] or "(no subject)", summary)
+               m["subject"] or "(no subject)", summary, att)
         )
     if category == "instruction":
         # HOOK(hermes): feed m["body_text"] into the agent loop here,
