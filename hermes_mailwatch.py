@@ -107,7 +107,16 @@ def best_body(msg):
         elif ctype == "text/html" and htm is None:
             htm = text
     text = plain if plain is not None else html_to_text(htm or "")
-    # drop quoted thread + signature
+    # CAPTURE FIRST: store full fidelity — forwarded content and quoted
+    # threads are often the entire point of the email. Cleaning is a
+    # triage-time concern (see triage_view), never a storage-time one.
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:BODY_LIMIT]
+
+
+def triage_view(text):
+    # For the model only: drop quoted thread + signature to save tokens,
+    # but keep forwarded content — it usually carries the payload.
     lines = []
     for line in text.splitlines():
         if line.startswith(">") or re.match(r"^On .{6,80} wrote:\s*$", line):
@@ -115,9 +124,7 @@ def best_body(msg):
         if line.strip() == "--":
             break
         lines.append(line)
-    text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:BODY_LIMIT]
+    return "\n".join(lines).strip() or text
 
 
 def normalize(raw):
@@ -157,7 +164,7 @@ def triage(m):
         "\"summary\": \"one tight factual sentence\"}\n\n"
         "FROM: %s <%s>\nSUBJECT: %s\nVERIFIED_PRINCIPAL: %s\nBODY:\n%s"
         % (m["from_name"] or "", m["from_addr"], m["subject"] or "",
-           m["is_ryan"], m["body_text"][:TRIAGE_LIMIT])
+           m["is_ryan"], triage_view(m["body_text"])[:TRIAGE_LIMIT])
     )
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
