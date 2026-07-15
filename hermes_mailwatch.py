@@ -139,12 +139,26 @@ def normalize(raw):
         received_at = email.utils.parsedate_to_datetime(msg.get("Date")).isoformat()
     except Exception:
         received_at = None
+    # Attachment awareness: the payload of an email is often a photo or a
+    # file, not text. Record what rode along so capture and triage know
+    # the words may not be the whole message.
+    attachments = []
+    for part in msg.walk():
+        fn = part.get_filename()
+        if fn:
+            attachments.append(decode_hdr(fn))
+        elif part.get_content_maintype() == "image":
+            attachments.append("inline-" + (part.get_content_subtype() or "image"))
+    body = best_body(msg)
+    if attachments:
+        body = (body + "\n\n[ATTACHMENTS: %s]" % ", ".join(attachments))[:BODY_LIMIT]
     return {
         "message_id": (msg.get("Message-ID") or "").strip() or None,
         "from_addr": from_addr or "unknown",
         "from_name": decode_hdr(from_name) or None,
         "subject": decode_hdr(msg.get("Subject", "")) or None,
-        "body_text": best_body(msg),
+        "body_text": body,
+        "attachments": attachments,
         "received_at": received_at,
         "is_ryan": from_addr == PRINCIPAL_ADDR and dkim_ok,
     }
@@ -251,10 +265,11 @@ def handle_message(raw):
     log("filed %s | %s | %s" % (category, m["from_addr"], m["subject"]))
     if category in ("instruction", "action"):
         tag = "INSTRUCTION" if category == "instruction" else "ACTION"
+        att = "\n📎 " + ", ".join(m["attachments"]) if m.get("attachments") else ""
         discord(
-            "**POST · %s**\n**%s** — %s\n%s"
+            "**POST · %s**\n**%s** — %s\n%s%s"
             % (tag, m["from_name"] or m["from_addr"],
-               m["subject"] or "(no subject)", summary)
+               m["subject"] or "(no subject)", summary, att)
         )
     if category == "instruction":
         # HOOK(hermes): feed m["body_text"] into the agent loop here,
