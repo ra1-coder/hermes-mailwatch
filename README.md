@@ -46,7 +46,7 @@ run_mailwatch.sh into whatever startup mechanism the runtime provides.
 - SUPABASE_SERVICE_ROLE_KEY — any key that can WRITE the mail table works.
   Verify empirically before trusting a differently-named key:
       curl -s -X POST "$SUPABASE_URL/rest/v1/mail" \
-        -H "apikey: $KEY" -H "Authorization: Bearer *** \
+        -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
         -H "Content-Type: application/json" -H "Prefer: return=representation" \
         -d '{"from_addr":"envtest@local","subject":"env test","category":"noise","status":"archived"}'
   A JSON row back = the key writes (the row is archived, invisible in the
