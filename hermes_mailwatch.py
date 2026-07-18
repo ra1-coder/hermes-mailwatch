@@ -10,7 +10,11 @@ Design contract (do not violate):
   only if from PRINCIPAL_ADDR *and* DKIM passed. Nobody ever gets a reply.
 - A message is marked \\Seen only after a successful store write.
 
-Stdlib only. Config via environment (see EnvironmentFile in the unit):
+Stdlib only, with ONE deliberate exception approved by Ryan (18 Jul 2026):
+Pillow, used solely to downscale oversized images for the vision triage
+call. If Pillow is absent the daemon degrades gracefully to the old
+behavior (capture everything, read only images already under the ceiling).
+Config via environment (see EnvironmentFile in the unit):
   GMAIL_USER, GMAIL_APP_PASSWORD,
   ANTHROPIC_API_KEY, HERMES_TRIAGE_MODEL (optional),
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
@@ -22,6 +26,7 @@ import email.header
 import email.utils
 import html.parser
 import imaplib
+import io
 import json
 import os
 import re
@@ -39,6 +44,12 @@ IMG_STORE_MAX = 15 * 1024 * 1024     # capture anything reasonable
 IMG_VISION_MAX = 4 * 1024 * 1024     # API image ceiling with base64 headroom
 IMG_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 VISION_COUNT = 3                     # at most this many images shown to triage
+
+try:
+    from PIL import Image  # the one approved non-stdlib import (18 Jul 2026)
+    _PIL = True
+except Exception:
+    _PIL = False
 
 ENV = os.environ
 MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-haiku-4-5-20251001")
@@ -229,6 +240,33 @@ def capture_files(m):
     return files
 
 
+def vision_bytes(img):
+    """Return (mime, data) fit for the vision call, or None.
+
+    The stored capture always keeps the ORIGINAL bytes at full fidelity —
+    downscaling exists only so the model can read what a full-resolution
+    phone photo shows. Progressive shrink until under the API ceiling.
+    """
+    if img["mime"] in IMG_VISION_TYPES and len(img["data"]) <= IMG_VISION_MAX:
+        return img["mime"], img["data"]
+    if not _PIL:
+        return None
+    try:
+        pic = Image.open(io.BytesIO(img["data"]))
+        pic = pic.convert("RGB")
+        for edge in (2000, 1600, 1280, 1024, 800):
+            copy = pic.copy()
+            copy.thumbnail((edge, edge))
+            buf = io.BytesIO()
+            copy.save(buf, format="JPEG", quality=82)
+            out = buf.getvalue()
+            if len(out) <= IMG_VISION_MAX:
+                return "image/jpeg", out
+    except Exception as e:
+        log("downscale failed for %s: %s" % (img.get("name"), e))
+    return None
+
+
 # ---------- the only model call ----------
 
 def triage(m):
@@ -250,10 +288,12 @@ def triage(m):
     for img in m.get("_images", []):
         if shown >= VISION_COUNT:
             break
-        if img["mime"] in IMG_VISION_TYPES and len(img["data"]) <= IMG_VISION_MAX:
+        fit = vision_bytes(img)
+        if fit:
+            mime, data = fit
             content.append({"type": "image", "source": {
-                "type": "base64", "media_type": img["mime"],
-                "data": base64.b64encode(img["data"]).decode()}})
+                "type": "base64", "media_type": mime,
+                "data": base64.b64encode(data).decode()}})
             shown += 1
     if shown:
         content[0]["text"] += (
