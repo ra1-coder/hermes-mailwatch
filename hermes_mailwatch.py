@@ -16,6 +16,7 @@ Stdlib only. Config via environment (see EnvironmentFile in the unit):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
   DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID
 """
+import base64
 import email
 import email.header
 import email.utils
@@ -33,6 +34,11 @@ CATEGORIES = ["instruction", "action", "personal", "receipt", "news", "noise"]
 IDLE_MINUTES = 24  # re-issue IDLE before Gmail's ~29-minute cutoff
 BODY_LIMIT = 4000      # stored in the database (capture first)
 TRIAGE_LIMIT = 2000    # sent to the model (category + one sentence needs no more)
+CAPTURE_BUCKET = "raw-attachments"   # capture bucket != vault (standing rule)
+IMG_STORE_MAX = 15 * 1024 * 1024     # capture anything reasonable
+IMG_VISION_MAX = 4 * 1024 * 1024     # API image ceiling with base64 headroom
+IMG_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+VISION_COUNT = 3                     # at most this many images shown to triage
 
 ENV = os.environ
 MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-haiku-4-5-20251001")
@@ -143,12 +149,27 @@ def normalize(raw):
     # file, not text. Record what rode along so capture and triage know
     # the words may not be the whole message.
     attachments = []
+    images = []
     for part in msg.walk():
         fn = part.get_filename()
+        is_image = part.get_content_maintype() == "image"
         if fn:
             attachments.append(decode_hdr(fn))
-        elif part.get_content_maintype() == "image":
+        elif is_image:
             attachments.append("inline-" + (part.get_content_subtype() or "image"))
+        if is_image:
+            try:
+                data = part.get_payload(decode=True)
+            except Exception:
+                data = None
+            if data and len(data) <= IMG_STORE_MAX:
+                name = decode_hdr(fn) if fn else (
+                    "inline-%d.%s" % (len(images) + 1, part.get_content_subtype() or "img"))
+                images.append({
+                    "name": name,
+                    "mime": part.get_content_type(),
+                    "data": data,
+                })
     body = best_body(msg)
     if attachments:
         body = (body + "\n\n[ATTACHMENTS: %s]" % ", ".join(attachments))[:BODY_LIMIT]
@@ -161,7 +182,51 @@ def normalize(raw):
         "attachments": attachments,
         "received_at": received_at,
         "is_ryan": from_addr == PRINCIPAL_ADDR and dkim_ok,
+        "_images": images,  # bytes ride outside the stored row
     }
+
+
+# ---------- capture: files land before any thinking ----------
+
+def _safe(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:80] or "file"
+
+
+def capture_files(m):
+    """Upload every image to the capture bucket; return the file records.
+
+    Capture-first doctrine: the original is preserved before triage runs.
+    Uploads are idempotent (x-upsert) so a crash-and-retry never duplicates.
+    A failed upload is recorded visibly on the row, never swallowed.
+    """
+    files = []
+    if not m.get("_images"):
+        return files
+    stamp = time.strftime("%Y%m")
+    key = _safe(m.get("message_id") or ("ts-%d" % int(time.time())))
+    for i, img in enumerate(m["_images"], 1):
+        path = "mail/%s/%s/%02d-%s" % (stamp, key, i, _safe(img["name"]))
+        req = urllib.request.Request(
+            ENV["SUPABASE_URL"].rstrip("/") + "/storage/v1/object/%s/%s" % (CAPTURE_BUCKET, path),
+            data=img["data"],
+            headers={
+                "Content-Type": img["mime"],
+                "apikey": ENV["SUPABASE_SERVICE_ROLE_KEY"],
+                "Authorization": "Bearer " + ENV["SUPABASE_SERVICE_ROLE_KEY"],
+                "x-upsert": "true",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if 200 <= r.status < 300:
+                    files.append({"name": img["name"], "path": path,
+                                  "mime": img["mime"], "size": len(img["data"])})
+                else:
+                    files.append({"name": img["name"], "error": "HTTP %s" % r.status})
+        except Exception as e:
+            log("capture failed for %s: %s" % (img["name"], e))
+            files.append({"name": img["name"], "error": str(e)[:200]})
+    return files
 
 
 # ---------- the only model call ----------
@@ -180,12 +245,27 @@ def triage(m):
         % (m["from_name"] or "", m["from_addr"], m["subject"] or "",
            m["is_ryan"], triage_view(m["body_text"])[:TRIAGE_LIMIT])
     )
+    content = [{"type": "text", "text": prompt}]
+    shown = 0
+    for img in m.get("_images", []):
+        if shown >= VISION_COUNT:
+            break
+        if img["mime"] in IMG_VISION_TYPES and len(img["data"]) <= IMG_VISION_MAX:
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": img["mime"],
+                "data": base64.b64encode(img["data"]).decode()}})
+            shown += 1
+    if shown:
+        content[0]["text"] += (
+            "\n\nIMAGES: %d attached and shown below. If an image is the "
+            "payload (a receipt, a document photo, a screenshot), read it and "
+            "summarize from what it shows." % shown)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({
             "model": MODEL,
             "max_tokens": 200,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": content}],
         }).encode(),
         headers={
             "Content-Type": "application/json",
@@ -212,10 +292,11 @@ def triage(m):
 
 # ---------- store + notify ----------
 
-def store(m, category, summary):
-    row = dict(m)
+def store(m, category, summary, files):
+    row = {k: v for k, v in m.items() if not k.startswith("_")}
     row["category"] = category
     row["summary"] = summary
+    row["files"] = files
     req = urllib.request.Request(
         ENV["SUPABASE_URL"].rstrip("/") + "/rest/v1/mail",
         data=json.dumps(row).encode(),
@@ -259,8 +340,9 @@ def discord(text):
 
 def handle_message(raw):
     m = normalize(raw)
+    files = capture_files(m)   # capture first, think second
     category, summary = triage(m)
-    ok = store(m, category, summary)
+    ok = store(m, category, summary, files)
     if not ok:
         return False
     if ok == "duplicate":
