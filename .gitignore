@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 mailwatch.env
 mailwatch.log
+discord_capturer.log
+.discord_cursor
+.discord_cursor.tmp
