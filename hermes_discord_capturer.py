@@ -141,6 +141,24 @@ def whoami():
     return str(me["id"]), me.get("username")
 
 
+def channel_guild_id(channel_id):
+    """The guild a channel belongs to.
+
+    REAL provenance, not a guess: GET /channels/{id}/messages does NOT echo
+    guild_id on message objects (only the gateway MESSAGE_CREATE event does),
+    but the channel object itself carries it. Every message in this channel
+    belongs to this guild by definition, so we resolve it once at startup and
+    stamp it on each row. A DM channel has no guild -> None.
+    """
+    try:
+        ch = _discord_get("/channels/%s" % channel_id)
+        gid = ch.get("guild_id")
+        return str(gid) if gid else None
+    except Exception as e:
+        log("guild resolve failed (%s) — rows will carry guild_id=null" % e)
+        return None
+
+
 def fetch_after(channel_id, after_id, limit=100):
     """Oldest-first list of messages strictly after after_id.
 
@@ -226,7 +244,7 @@ def capture_attachments(msg):
 
 # ---------- store: one raw_event per message ----------
 
-def build_row(msg, bot_id, attachments):
+def build_row(msg, bot_id, attachments, guild_id=None):
     author = msg.get("author") or {}
     author_id = str(author.get("id", ""))
     is_hermes = author_id == bot_id
@@ -253,7 +271,7 @@ def build_row(msg, bot_id, attachments):
         "timestamp": msg.get("timestamp"),
         "edited_timestamp": msg.get("edited_timestamp"),
         "channel_id": str(msg.get("channel_id", "")),
-        "guild_id": str(msg["guild_id"]) if msg.get("guild_id") else None,
+        "guild_id": (str(msg["guild_id"]) if msg.get("guild_id") else guild_id),
         "message_type": msg.get("type"),
         "reply_to": (msg.get("referenced_message") or {}).get("id"),
     }
@@ -314,10 +332,10 @@ def save_cursor(mid):
 
 # ---------- the dumb transport loop ----------
 
-def handle_message(msg, bot_id):
+def handle_message(msg, bot_id, guild_id=None):
     """Capture one message. Returns True on success (cursor may advance)."""
     attachments = capture_attachments(msg)   # capture originals first
-    row, is_hermes = build_row(msg, bot_id, attachments)
+    row, is_hermes = build_row(msg, bot_id, attachments, guild_id)
     result = store(row)
     who = "hermes" if is_hermes else row["sender"]
     if result == "duplicate":
@@ -331,8 +349,9 @@ def main():
     channel_id = _need("DISCORD_CHANNEL_ID")
     _need("SUPABASE_URL"); _need("SUPABASE_SERVICE_ROLE_KEY")
     bot_id, bot_name = whoami()
-    log("discord capturer starting | bot=%s (%s) | channel=%s | poll=%ss"
-        % (bot_name, bot_id, channel_id, POLL_SECONDS))
+    guild_id = channel_guild_id(channel_id)
+    log("discord capturer starting | bot=%s (%s) | channel=%s | guild=%s | poll=%ss"
+        % (bot_name, bot_id, channel_id, guild_id, POLL_SECONDS))
 
     cursor = load_cursor()
     if cursor is None:
@@ -352,7 +371,7 @@ def main():
                 # File this message. If it fails, STOP advancing the cursor so
                 # the next cycle retries from here — never silently drop.
                 try:
-                    handle_message(msg, bot_id)
+                    handle_message(msg, bot_id, guild_id)
                 except Exception as e:
                     log("capture FAILED for %s (%s) — cursor held, will retry"
                         % (msg.get("id"), e))
