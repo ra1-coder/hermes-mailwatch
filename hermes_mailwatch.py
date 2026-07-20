@@ -449,6 +449,9 @@ def idle_wait(conn):
 
 def main():
     log("hermes mail watcher starting (model on mail only: %s)" % MODEL)
+    log("vision: Pillow %s" % (
+        "available — oversized images will be downscaled and read" if _PIL
+        else "ABSENT in this runtime — oversized images will be captured but NOT read"))
     while True:
         try:
             conn = imaplib.IMAP4_SSL("imap.gmail.com")
