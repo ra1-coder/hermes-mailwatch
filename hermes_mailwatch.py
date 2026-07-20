@@ -54,7 +54,10 @@ except Exception as _e:
     _PIL_ERR = str(_e)[:200]  # a future ABSENT explains itself
 
 ENV = os.environ
-MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-haiku-4-5-20251001")
+# Sonnet 5 for ALL mail triage — Ryan's ruling, 20 Jul 2026. Haiku was a
+# silent cost default from the original build, never surfaced as a decision;
+# it misread a shop receipt as a flight receipt once vision went live.
+MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-sonnet-5")
 
 
 def log(msg):
@@ -299,9 +302,11 @@ def triage(m):
             shown += 1
     if shown:
         content[0]["text"] += (
-            "\n\nIMAGES: %d attached and shown below. If an image is the "
-            "payload (a receipt, a document photo, a screenshot), read it and "
-            "summarize from what it shows." % shown)
+            "\n\nIMAGES: %d attached and shown below. TRANSCRIBE, DO NOT "
+            "INFER: read what is literally printed — merchant/sender name, "
+            "amounts with their currency symbols, dates — and quote them "
+            "exactly. Never guess a document type; if a detail is not "
+            "visibly printed, leave it out rather than inventing it." % shown)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({
