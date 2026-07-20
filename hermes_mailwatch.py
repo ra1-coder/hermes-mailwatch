@@ -48,8 +48,10 @@ VISION_COUNT = 3                     # at most this many images shown to triage
 try:
     from PIL import Image  # the one approved non-stdlib import (18 Jul 2026)
     _PIL = True
-except Exception:
+    _PIL_ERR = None
+except Exception as _e:
     _PIL = False
+    _PIL_ERR = str(_e)[:200]  # a future ABSENT explains itself
 
 ENV = os.environ
 MODEL = ENV.get("HERMES_TRIAGE_MODEL", "claude-haiku-4-5-20251001")
@@ -451,7 +453,7 @@ def main():
     log("hermes mail watcher starting (model on mail only: %s)" % MODEL)
     log("vision: Pillow %s" % (
         "available — oversized images will be downscaled and read" if _PIL
-        else "ABSENT in this runtime — oversized images will be captured but NOT read"))
+        else "ABSENT in this runtime — oversized images will be captured but NOT read (import error: %s)" % _PIL_ERR))
     while True:
         try:
             conn = imaplib.IMAP4_SSL("imap.gmail.com")
