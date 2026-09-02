@@ -476,8 +476,20 @@ def store(row):
     Returns 'inserted', 'duplicate', or raises so the caller leaves the cursor
     where it is and retries next cycle.
     """
+    # on_conflict MUST name the actual unique constraint columns
+    # (source, source_object_id). Without it, PostgREST's ignore-duplicates
+    # only no-ops against the PRIMARY KEY conflict target — a duplicate on
+    # this (non-PK) unique constraint instead raises a raw 23505 / HTTP 409,
+    # which store() would previously treat as a hard failure, not a benign
+    # duplicate. Caught live during the 2 Sep 2026 30-day backfill: 48 rows
+    # that were correctly already-filed duplicates surfaced as "failed"
+    # instead of "duplicate" until this was added. This also matters for the
+    # live daemon's own crash-retry path: a message that fails AFTER insert
+    # but before the cursor save would previously re-hit this same false
+    # failure forever on retry.
     req = urllib.request.Request(
-        _need("SUPABASE_URL").rstrip("/") + "/rest/v1/raw_events",
+        _need("SUPABASE_URL").rstrip("/")
+        + "/rest/v1/raw_events?on_conflict=source,source_object_id",
         data=json.dumps(row).encode(),
         headers={
             "Content-Type": "application/json",
@@ -486,11 +498,25 @@ def store(row):
             "Prefer": "resolution=ignore-duplicates,return=representation",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        if not (200 <= r.status < 300):
-            raise RuntimeError("store non-2xx: %s" % r.status)
-        body = r.read().decode().strip()
-        return "duplicate" if body in ("", "[]") else "inserted"
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if not (200 <= r.status < 300):
+                raise RuntimeError("store non-2xx: %s" % r.status)
+            body = r.read().decode().strip()
+            return "duplicate" if body in ("", "[]") else "inserted"
+    except urllib.error.HTTPError as e:
+        # Belt-and-suspenders: even with the correct on_conflict target above,
+        # treat a 409/23505 unique-violation as a benign duplicate rather than
+        # a hard failure — a duplicate row is definitionally "already filed",
+        # never a reason to hold the cursor and retry forever.
+        if e.code == 409:
+            try:
+                body = e.read().decode()
+            except Exception:
+                body = ""
+            if "23505" in body or "duplicate key" in body:
+                return "duplicate"
+        raise
 
 
 # ---------- cursor: per-channel, go-forward only per channel, survives restart ----------
