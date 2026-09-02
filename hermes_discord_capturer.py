@@ -5,7 +5,7 @@ Ruled by Ryan 19 Jul 2026 (spec 065c1cb0). Companion to hermes_mailwatch.py.
 
 Deciding principle (Ryan): THE CAPTURER MUST OUTLIVE THE THINKER.
 A gateway hook dies whenever the brain dies — capture would stop exactly when
-the record matters most. This is an INDEPENDENT daemon: it reads the channel's
+the record matters most. This is an INDEPENDENT daemon: it reads channel
 message history over the REST API and files every message — both directions —
 before the agent reasons over it. It keeps filing even while the gateway is
 down; the backlog is processed on return. It touches NOTHING about how Hermes
@@ -18,22 +18,48 @@ Design contract (do not violate):
 - BOTH DIRECTIONS. Inbound (Ryan / others) AND Hermes's own outbound sends are
   captured. Hermes's messages land in channel history like any other; we tag
   sender=hermes by matching the bot's own user id.
-- FULL FIDELITY. raw_text stores the complete message content, never truncated
-  or summarized. (Truncation is a model-view concern, never a storage one.)
+- ALL THREADS OF THE HOME CHANNEL, ACTIVE AND ARCHIVED (fix, 2 Sep 2026,
+  task filed same date). Ryan's conversations with Hermes happen in per-message
+  THREADS off the home channel (Discord auto-threads each top-level message).
+  GET /channels/{home}/messages only ever returns the thread-STARTER message —
+  every reply inside a thread lives in a separate channel-shaped object
+  (the thread itself) and is invisible to a capturer that only polls the
+  parent. This was the live bug found 2 Sep 2026: an entire session's replies
+  (agent + Ryan) went uncaptured while direct top-level nudges were fine.
+  FIX: track the home channel PLUS every thread parented to it (active via
+  GET /guilds/{g}/threads/active, archived via
+  GET /channels/{home}/threads/archived/public, paginated), each with its own
+  go-forward cursor, re-discovering new/newly-archived threads on a timer.
+- EMBED + COMPONENT TEXT (retested + actually implemented 2 Sep 2026 — task
+  7c048c4e was marked done in the store but the deployed code never touched
+  msg['embeds'] or msg['components']; that claim was false, corrected here).
+  Hermes's own question cards / approval blocks render as embeds with the
+  visible text in embed title/description/fields/footer, and buttons carry
+  label text in components — msg['content'] alone is blank or near-blank for
+  these. flatten_embeds()/flatten_components() pull that text into raw_text
+  (delimited, full fidelity) and the raw embeds/components JSON (secret-masked)
+  is preserved in raw_json for structure.
+- FULL FIDELITY. raw_text stores the complete message content (+ flattened
+  embed/component text), never truncated or summarized.
 - REAL PROVENANCE. raw_json carries the actual Discord fields: message id,
-  author id + name, timestamp, channel id, guild id. No hand-built stubs.
+  author id + name, timestamp, channel id, guild id, thread id/parent when
+  applicable. No hand-built stubs.
 - DEDUPE. source_object_id = the Discord message id. Inserts use
-  resolution=ignore-duplicates so retries and reconnects never double-file.
+  resolution=ignore-duplicates so retries, reconnects, and the one-time
+  backfill script (backfill_discord_threads.py) never double-file.
 - VITALS FLOOD LAW. Transcript rows file as processing_status=processed (note:
   "transcript capture — handled live by agent"), NEVER pending. A full
   transcript at pending would flood the Wire's "to route" count with chat noise.
-- CREDENTIALS LAW. If a message matches a secret pattern (API key, token,
-  password), store it with the secret MASKED and note the redaction. The
-  credentials-live-in-two-homes law outranks full-fidelity storage for secrets.
+- CREDENTIALS LAW. If a message (or embed/component text) matches a secret
+  pattern (API key, token, password), store it with the secret MASKED and
+  note the redaction. The credentials-live-in-two-homes law outranks
+  full-fidelity storage for secrets.
 - ATTACHMENTS. Originals mirror to the raw-attachments bucket under
   discord/YYYYMM/... and are referenced on the event (mirrors mailwatch).
-- FAILURES ARE VISIBLE. A failed capture is logged and the cursor is NOT
-  advanced past it, so the next cycle retries it. Nothing is silently dropped.
+- FAILURES ARE VISIBLE. A failed capture is logged and that channel's cursor
+  is NOT advanced past it, so the next cycle retries it. A failure on one
+  tracked channel (e.g. a deleted/locked thread) never blocks polling of the
+  others. Nothing is silently dropped.
 
 Transport: stdlib only, urllib REST polling — same plumbing the mailwatch
 daemon already uses to talk to Discord. No discord.py, no WebSocket library
@@ -46,6 +72,8 @@ Config via environment (reuses mailwatch.env — no new secrets):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 Optional:
   DISCORD_POLL_SECONDS (default 5)
+  DISCORD_THREAD_REFRESH_SECONDS (default 300) — how often to re-discover
+    active/newly-archived threads under the home channel.
   DISCORD_CURSOR_FILE  (default /data/hermes-intake/.discord_cursor)
 """
 import json
@@ -58,9 +86,10 @@ import urllib.request
 
 ENV = os.environ
 API = "https://discord.com/api/v10"
-UA = "DiscordBot (hermes-discord-capturer, 1.0)"
+UA = "DiscordBot (hermes-discord-capturer, 1.1)"
 CAPTURE_BUCKET = "raw-attachments"      # capture bucket != vault (standing rule)
 POLL_SECONDS = int(ENV.get("DISCORD_POLL_SECONDS", "5"))
+THREAD_REFRESH_SECONDS = int(ENV.get("DISCORD_THREAD_REFRESH_SECONDS", "300"))
 CURSOR_FILE = ENV.get("DISCORD_CURSOR_FILE", "/data/hermes-intake/.discord_cursor")
 ATT_STORE_MAX = 25 * 1024 * 1024        # capture anything reasonable
 PROCESSED_NOTE = "transcript capture — handled live by agent"
@@ -124,6 +153,71 @@ def mask_secrets(text):
     return masked, ordered
 
 
+def mask_json_secrets(obj):
+    """Mask secrets inside an arbitrary JSON-able structure (embeds/components).
+
+    Full-fidelity structure is preserved by round-tripping through JSON text:
+    serialize -> mask the text -> parse back. If the masked text somehow isn't
+    valid JSON anymore (a mask marker landing awkwardly), fall back to storing
+    the masked text itself rather than losing the redaction.
+    """
+    if not obj:
+        return obj, []
+    text = json.dumps(obj, ensure_ascii=False)
+    masked_text, labels = mask_secrets(text)
+    if not labels:
+        return obj, []
+    try:
+        return json.loads(masked_text), labels
+    except Exception:
+        return {"_masked_raw": masked_text}, labels
+
+
+# ---------- embed / component flattening (fixes task 7c048c4e for real) ----------
+
+def flatten_embeds(embeds):
+    """Pull visible text out of embeds into plain lines: title, description,
+    each field name+value, footer, author. This is what Hermes's own question
+    cards, approval blocks, and briefs render as — msg['content'] is blank for
+    these, so without this the record shows an empty outbound message.
+    """
+    parts = []
+    for e in (embeds or []):
+        if e.get("author", {}).get("name"):
+            parts.append("[EMBED AUTHOR] %s" % e["author"]["name"])
+        if e.get("title"):
+            parts.append("[EMBED TITLE] %s" % e["title"])
+        if e.get("description"):
+            parts.append("[EMBED DESC] %s" % e["description"])
+        for f in (e.get("fields") or []):
+            parts.append("[EMBED FIELD] %s: %s" % (f.get("name", ""), f.get("value", "")))
+        footer = e.get("footer") or {}
+        if footer.get("text"):
+            parts.append("[EMBED FOOTER] %s" % footer["text"])
+    return parts
+
+
+def flatten_components(components):
+    """Pull button/select-option labels out of action rows (Approve/Edit/Cancel
+    etc.), recursing into nested component containers.
+    """
+    parts = []
+
+    def walk(comps):
+        for c in (comps or []):
+            label = c.get("label")
+            if label:
+                parts.append("[BUTTON] %s" % label)
+            for opt in (c.get("options") or []):
+                if opt.get("label"):
+                    parts.append("[OPTION] %s" % opt["label"])
+            if c.get("components"):
+                walk(c["components"])
+
+    walk(components)
+    return parts
+
+
 # ---------- discord REST ----------
 
 def _discord_get(path):
@@ -148,7 +242,8 @@ def channel_guild_id(channel_id):
     guild_id on message objects (only the gateway MESSAGE_CREATE event does),
     but the channel object itself carries it. Every message in this channel
     belongs to this guild by definition, so we resolve it once at startup and
-    stamp it on each row. A DM channel has no guild -> None.
+    stamp it on each row (threads inherit the same guild). A DM channel has no
+    guild -> None.
     """
     try:
         ch = _discord_get("/channels/%s" % channel_id)
@@ -176,6 +271,69 @@ def fetch_latest_id(channel_id):
     """Newest message id in the channel — the go-forward starting cursor."""
     msgs = _discord_get("/channels/%s/messages?limit=1" % channel_id)
     return str(msgs[0]["id"]) if msgs else None
+
+
+# ---------- thread discovery: ALL threads of the home channel, active + archived ----------
+
+def list_active_threads(guild_id, parent_channel_id):
+    """Every active thread in the guild, filtered to this parent channel.
+
+    GET /guilds/{g}/threads/active is guild-wide (there is no per-channel
+    active-threads endpoint), so we filter client-side on parent_id.
+    """
+    if not guild_id:
+        return []
+    try:
+        data = _discord_get("/guilds/%s/threads/active" % guild_id)
+        threads = data.get("threads") or []
+        return [t for t in threads if str(t.get("parent_id")) == str(parent_channel_id)]
+    except Exception as e:
+        log("active-thread discovery failed (%s)" % e)
+        return []
+
+
+def list_archived_public_threads(parent_channel_id):
+    """Every archived PUBLIC thread parented to this channel, paginated.
+
+    Archived threads age out of the active-threads endpoint (auto-archive is
+    1440 min per the thread's metadata) — without this call, a thread that
+    goes quiet for a day drops off discovery entirely even though Discord
+    still serves its full history.
+    """
+    out = []
+    before = None
+    for _ in range(20):  # hard cap: 20 pages * 100 = 2000 threads, plenty
+        q = "?limit=100"
+        if before:
+            q += "&before=%s" % urllib.parse.quote(before)
+        try:
+            data = _discord_get("/channels/%s/threads/archived/public%s" % (parent_channel_id, q))
+        except Exception as e:
+            log("archived-thread discovery failed (%s)" % e)
+            break
+        threads = data.get("threads") or []
+        out.extend(threads)
+        if not data.get("has_more") or not threads:
+            break
+        before = threads[-1].get("thread_metadata", {}).get("archive_timestamp")
+        if not before:
+            break
+    return out
+
+
+def discover_tracked_channels(home_channel_id, guild_id):
+    """Home channel + every thread (active and archived) parented to it.
+
+    Returns a dict {channel_id: thread_or_none} — thread_or_none is the
+    Discord thread object (for logging/name) or None for the home channel
+    itself.
+    """
+    tracked = {str(home_channel_id): None}
+    for t in list_active_threads(guild_id, home_channel_id):
+        tracked[str(t["id"])] = t
+    for t in list_archived_public_threads(home_channel_id):
+        tracked[str(t["id"])] = t
+    return tracked
 
 
 # ---------- attachments: originals to the capture bucket ----------
@@ -244,7 +402,7 @@ def capture_attachments(msg):
 
 # ---------- store: one raw_event per message ----------
 
-def build_row(msg, bot_id, attachments, guild_id=None):
+def build_row(msg, bot_id, attachments, guild_id=None, home_channel_id=None):
     author = msg.get("author") or {}
     author_id = str(author.get("id", ""))
     is_hermes = author_id == bot_id
@@ -253,12 +411,27 @@ def build_row(msg, bot_id, attachments, guild_id=None):
     sender = "hermes" if is_hermes else author_name
 
     content = msg.get("content") or ""
-    masked_text, redactions = mask_secrets(content)
+    channel_id = str(msg.get("channel_id", ""))
+    is_thread = bool(home_channel_id) and channel_id != str(home_channel_id)
+
+    # Embed + component text (task 7c048c4e, actually implemented this pass).
+    embed_parts = flatten_embeds(msg.get("embeds"))
+    component_parts = flatten_components(msg.get("components"))
+    extra_parts = embed_parts + component_parts
+    full_text = content
+    if extra_parts:
+        full_text = (content + "\n" if content else "") + "\n".join(extra_parts)
+
+    masked_text, redactions = mask_secrets(full_text)
+    masked_embeds, embed_redactions = mask_json_secrets(msg.get("embeds"))
+    masked_components, comp_redactions = mask_json_secrets(msg.get("components"))
+    all_redactions = redactions + [l for l in embed_redactions if l not in redactions] \
+        + [l for l in comp_redactions if l not in redactions]
 
     note = PROCESSED_NOTE
-    if redactions:
+    if all_redactions:
         note = "%s; secret(s) masked before storage: %s" % (
-            PROCESSED_NOTE, ", ".join(redactions))
+            PROCESSED_NOTE, ", ".join(all_redactions))
 
     raw_json = {
         "platform": "discord",
@@ -270,13 +443,20 @@ def build_row(msg, bot_id, attachments, guild_id=None):
         "direction": "outbound" if is_hermes else "inbound",
         "timestamp": msg.get("timestamp"),
         "edited_timestamp": msg.get("edited_timestamp"),
-        "channel_id": str(msg.get("channel_id", "")),
+        "channel_id": channel_id,
         "guild_id": (str(msg["guild_id"]) if msg.get("guild_id") else guild_id),
         "message_type": msg.get("type"),
         "reply_to": (msg.get("referenced_message") or {}).get("id"),
+        "is_thread": is_thread,
+        "thread_id": channel_id if is_thread else None,
+        "parent_channel_id": str(home_channel_id) if (home_channel_id and is_thread) else None,
     }
-    if redactions:
-        raw_json["redactions"] = redactions
+    if masked_embeds:
+        raw_json["embeds"] = masked_embeds
+    if masked_components:
+        raw_json["components"] = masked_components
+    if all_redactions:
+        raw_json["redactions"] = all_redactions
 
     return {
         "source": "discord",
@@ -313,36 +493,86 @@ def store(row):
         return "duplicate" if body in ("", "[]") else "inserted"
 
 
-# ---------- cursor: go-forward only, survives restart ----------
+# ---------- cursor: per-channel, go-forward only per channel, survives restart ----------
+#
+# File format is JSON: {"channels": {"<channel_id>": "<last_msg_id>", ...}}.
+# Back-compat: a pre-existing cursor file from before multi-thread support was
+# a bare message-id string (the home channel's cursor only) — migrate it in
+# place under the home channel's id on first load rather than losing it.
 
-def load_cursor():
+def load_cursors(home_channel_id):
     try:
         with open(CURSOR_FILE) as f:
-            return f.read().strip() or None
+            raw = f.read().strip()
     except FileNotFoundError:
-        return None
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "channels" in data:
+            return {str(k): str(v) for k, v in data["channels"].items()}
+    except Exception:
+        pass
+    # legacy bare-string cursor: it was always the home channel's cursor
+    return {str(home_channel_id): raw}
 
 
-def save_cursor(mid):
+def save_cursors(cursors):
     tmp = CURSOR_FILE + ".tmp"
     with open(tmp, "w") as f:
-        f.write(str(mid))
+        json.dump({"channels": cursors}, f)
     os.replace(tmp, CURSOR_FILE)
 
 
 # ---------- the dumb transport loop ----------
 
-def handle_message(msg, bot_id, guild_id=None):
+def handle_message(msg, bot_id, guild_id=None, home_channel_id=None):
     """Capture one message. Returns True on success (cursor may advance)."""
     attachments = capture_attachments(msg)   # capture originals first
-    row, is_hermes = build_row(msg, bot_id, attachments, guild_id)
+    row, is_hermes = build_row(msg, bot_id, attachments, guild_id, home_channel_id)
     result = store(row)
     who = "hermes" if is_hermes else row["sender"]
+    tag = "" if str(msg.get("channel_id")) == str(home_channel_id) else " [thread %s]" % msg.get("channel_id")
     if result == "duplicate":
-        log("already filed %s | %s | %s" % (msg["id"], who, (row["raw_text"] or "")[:60]))
+        log("already filed %s%s | %s | %s" % (msg["id"], tag, who, (row["raw_text"] or "")[:60]))
     else:
-        log("filed %s | %s | %s" % (msg["id"], who, (row["raw_text"] or "")[:60]))
+        log("filed %s%s | %s | %s" % (msg["id"], tag, who, (row["raw_text"] or "")[:60]))
     return True
+
+
+def poll_channel(channel_id, cursors, bot_id, guild_id, home_channel_id, is_new):
+    """Poll one channel, advancing its cursor as messages file successfully.
+
+    is_new=True means this channel was JUST discovered this cycle (e.g. a
+    fresh thread). Per the go-forward-only policy (mirrors the home channel's
+    original anchor rule), a newly discovered channel anchors at its CURRENT
+    latest message id rather than walking its full history live — the daemon
+    fix is go-forward; recovering the already-existing backlog for threads
+    that predate this fix is the separate one-time backfill script
+    (backfill_discord_threads.py), which is explicitly allowed to walk full
+    history because it's a bounded one-time job, not an ever-growing live poll.
+    """
+    cursor = cursors.get(channel_id)
+    if cursor is None:
+        if is_new:
+            latest = fetch_latest_id(channel_id)
+            cursors[channel_id] = latest  # may be None if channel is empty
+            log("new channel tracked, anchored go-forward at %s: %s" % (latest, channel_id))
+            return
+        cursor = None  # known channel with no messages yet ever seen
+
+    batch = fetch_after(channel_id, cursor, limit=100)
+    for msg in batch:
+        try:
+            handle_message(msg, bot_id, guild_id, home_channel_id)
+        except Exception as e:
+            log("capture FAILED for %s in channel %s (%s) — cursor held, will retry"
+                % (msg.get("id"), channel_id, e))
+            raise
+        cursor = str(msg["id"])
+        cursors[channel_id] = cursor
+        save_cursors(cursors)
 
 
 def main():
@@ -350,51 +580,56 @@ def main():
     _need("SUPABASE_URL"); _need("SUPABASE_SERVICE_ROLE_KEY")
     bot_id, bot_name = whoami()
     guild_id = channel_guild_id(channel_id)
-    log("discord capturer starting | bot=%s (%s) | channel=%s | guild=%s | poll=%ss"
-        % (bot_name, bot_id, channel_id, guild_id, POLL_SECONDS))
+    log("discord capturer starting | bot=%s (%s) | home_channel=%s | guild=%s | poll=%ss | thread_refresh=%ss"
+        % (bot_name, bot_id, channel_id, guild_id, POLL_SECONDS, THREAD_REFRESH_SECONDS))
 
-    cursor = load_cursor()
-    if cursor is None:
-        # GO-FORWARD ONLY: the lost days are accepted as unrecoverable. Start at
-        # the newest message so we never backfill history.
-        cursor = fetch_latest_id(channel_id)
-        if cursor:
-            save_cursor(cursor)
-            log("no cursor on file — anchoring go-forward at latest id %s" % cursor)
-        else:
-            log("channel empty — will anchor on first message")
+    cursors = load_cursors(channel_id)
+    if channel_id not in cursors:
+        # GO-FORWARD ONLY on first ever run: the lost days are accepted as
+        # unrecoverable for the home channel itself (original spec). Start at
+        # the newest message so we never backfill history live.
+        latest = fetch_latest_id(channel_id)
+        cursors[channel_id] = latest
+        save_cursors(cursors)
+        log("no cursor on file for home channel — anchoring go-forward at latest id %s" % latest)
+
+    tracked = {channel_id: None}
+    last_thread_refresh = 0
 
     while True:
         try:
-            batch = fetch_after(channel_id, cursor, limit=100)
-            for msg in batch:
-                # File this message. If it fails, STOP advancing the cursor so
-                # the next cycle retries from here — never silently drop.
+            now = time.time()
+            if now - last_thread_refresh >= THREAD_REFRESH_SECONDS:
+                discovered = discover_tracked_channels(channel_id, guild_id)
+                new_ids = set(discovered) - set(tracked)
+                if new_ids:
+                    log("thread discovery: %d new thread(s) of %d tracked total"
+                        % (len(new_ids), len(discovered)))
+                tracked = discovered
+                last_thread_refresh = now
+
+            for cid in list(tracked.keys()):
+                is_new = cid not in cursors
                 try:
-                    handle_message(msg, bot_id, guild_id)
+                    poll_channel(cid, cursors, bot_id, guild_id, channel_id, is_new)
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try:
+                        body = e.read().decode()[:200]
+                    except Exception:
+                        pass
+                    if e.code == 429:
+                        log("rate limited (429) on %s — backing off 10s | %s" % (cid, body))
+                        time.sleep(10)
+                    elif e.code == 404:
+                        log("channel %s gone (404) — dropping from tracked set" % cid)
+                        tracked.pop(cid, None)
+                    else:
+                        log("discord/store HTTP %s on %s (%s) — will retry next cycle" % (e.code, cid, body))
                 except Exception as e:
-                    log("capture FAILED for %s (%s) — cursor held, will retry"
-                        % (msg.get("id"), e))
-                    raise  # break out to the outer sleep+retry
-                cursor = str(msg["id"])
-                save_cursor(cursor)
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode()[:200]
-            except Exception:
-                pass
-            if e.code == 429:
-                log("rate limited (429) — backing off 10s | %s" % body)
-                time.sleep(10)
-            else:
-                log("discord/store HTTP %s (%s) — retry in %ss" % (e.code, body, POLL_SECONDS))
-                time.sleep(POLL_SECONDS)
-            continue
+                    log("cycle error on channel %s (%s) — will retry next cycle" % (cid, e))
         except Exception as e:
-            log("cycle error (%s) — retry in %ss" % (e, POLL_SECONDS))
-            time.sleep(POLL_SECONDS)
-            continue
+            log("outer cycle error (%s) — retry in %ss" % (e, POLL_SECONDS))
         time.sleep(POLL_SECONDS)
 
 
