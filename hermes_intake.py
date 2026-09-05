@@ -223,8 +223,26 @@ def artifact(a_type, title, body=None, desk="front_desk", status="new",
              project=None, source_event=None, metadata=None, links=None, due=None,
              waiting_test_ack=None, name_trigger_override=None):
     name_hit, money_hit, matched_via = _name_trigger_scan(title, body)
+    is_loose_end = (a_type == "loose_end" and desk == "loose_ends")
+    # ROUTED-BY STAMP (Ryan, 5 Sep 2026): every row records what the NAME
+    # TRIGGER code actually did with it, so "routed by the reflex" is
+    # verifiable on the row itself, not just a claim in chat/session history.
+    if not name_hit:
+        gate_outcome = "no_name_detected"
+    elif is_loose_end:
+        gate_outcome = "name_detected_already_loose_end"
+    elif name_trigger_override:
+        gate_outcome = "name_detected_override_used"
+    elif money_hit:
+        gate_outcome = "MUST_NOT_REACH_HERE"  # _die() below fires first
+    else:
+        gate_outcome = "name_detected_waiting_test_ack_used"
+    name_trigger_stamp = {
+        "scanned": True, "name_hit": name_hit, "money_hit": money_hit,
+        "matched_via": matched_via, "gate_outcome": gate_outcome,
+        "code_ref": "hermes_intake.py:_name_trigger_scan+artifact (rule 498125c6)",
+    }
     if name_hit and not name_trigger_override:
-        is_loose_end = (a_type == "loose_end" and desk == "loose_ends")
         if money_hit and not is_loose_end:
             _die(
                 "NAME TRIGGER (rule 498125c6): money verb + named person detected "
@@ -245,11 +263,11 @@ def artifact(a_type, title, body=None, desk="front_desk", status="new",
             )
     row = {"type": a_type, "title": title, "body": body, "desk": desk,
            "status": status, "metadata": metadata or {}}
+    row["metadata"] = dict(row["metadata"] or {})
+    row["metadata"]["name_trigger_check"] = name_trigger_stamp
     if waiting_test_ack:
-        row["metadata"] = dict(row["metadata"] or {})
         row["metadata"]["waiting_test_ack"] = waiting_test_ack
     if name_trigger_override:
-        row["metadata"] = dict(row["metadata"] or {})
         row["metadata"]["name_trigger_override"] = name_trigger_override
     if due:
         row["due_at"] = due  # ISO 8601; feeds Today (due 48h) and Inbox (overdue)
