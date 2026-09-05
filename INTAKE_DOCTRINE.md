@@ -19,6 +19,50 @@ a concrete reason — a date, a request, a decision, a named commitment, a
 document worth retrieving later. Ryan's attention is the scarce resource;
 storage is not.
 
+## 2b. The standing-law check, wired into intake itself (25 Jul 2026)
+
+Before filing ANYTHING from Ryan — before choosing `no_action` vs an
+artifact, before choosing a type or a desk — I run two checks, in order,
+against the current head rules (fetch fresh from the ledger; never trust an
+id cached in a doc):
+
+1. **THE PLAIN SPEECH LAW** (ledger `rule`, head as of 20 Jul 2026: `ccd4fab9`).
+   If Ryan's words carry an unstated purpose that changes how the item should
+   be filed or settled (what a receipt/payment is for, who it's between,
+   what the finish line is), I ask the plain question NOW, before marking the
+   event `processed`/`no_action` — I do not file first and ask later. A
+   `no_action` mark is itself a filing decision the law applies to.
+2. **THE LOOSE-END ROUTING TEST — person, not date** (ledger `rule`, head as
+   of 25 Jul 2026: `f199709d`, supersedes `6bd5b65e`). Before routing an
+   intention to Front Desk, I ask: is there a PERSON on the other side of
+   this, unsettled, in either direction? If yes, it is a `loose_end`
+   (concierge), regardless of whether it carries a date — a due date is not
+   the test. Only a solo errand with no counterparty stays Front Desk.
+
+Failure mode this closes: a receipt was marked `no_action` without asking
+its plain-language purpose question six minutes after the law took effect,
+and a person-directed thank-you was routed to Front Desk on a date-based
+reflex instead of the person-test. Both were live misses, corrected
+25 Jul 2026 (see ledger `rule` `f199709d` metadata and the reopened
+`raw_events` row for the receipt). This section exists so the check runs
+inline during filing, not as a later audit.
+
+**Amendment, 4 Sep 2026 (task 215ba9b6):** check 2 above is superseded in
+its phrasing by THE WAITING TEST (ledger `rule` `498125c6`, amended
+4 Sep 2026) — "is someone waiting on you to deliver something?" — same
+routing outcome (person + unsettled = loose_end), sharper question. A third
+miss on 3 Sep 2026 ("Pay Uncle Jo ₱620" filed front_desk, nine days after
+the rule existed) showed that a prose-only check in this file is a check
+that can be silently skipped — the rule existed and was simply not
+consulted at filing time. THE NAME TRIGGER closes that hole as CODE, not
+doctrine: `hermes_intake.py artifact` now mechanically scans every filing's
+title+body for a named person and hard-blocks non-loose_end filings until
+the Waiting Test is answered (`--waiting-test-ack`) or the trigger is
+explicitly overridden as a false positive (`--name-trigger-override`). See
+the module docstring in `hermes_intake.py` §7 for the exact gate mechanics.
+This is the first standing-law check in this pipe enforced by the tool
+itself rather than by an agent remembering to read this file.
+
 ## 3. Every artifact keeps its thread
 
 When an event does become something, I create it with `--source-event` so

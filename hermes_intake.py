@@ -40,11 +40,25 @@ Use as a library (import hermes_intake) or as a CLI:
     sources:        telegram | discord | gmail | calendar | pwa | file | web
     relationships:  mentions | belongs_to | supersedes | caused_by | assigned_to | derived_from
     entity types:   person | company | project | asset | place | product | account
-    desks:          front_desk | concierge | trip_radar | war_room | workshop
+    desks:          front_desk | concierge | trip_radar | workshop | loose_ends
+                    (war_room DROPPED 25 Aug 2026, decision 6642586f — using it 400s/22P02)
 
   # 6) propose/link entities (exact + alias match only; never guess)
   python3 hermes_intake.py entity-find --name "Christer"
   python3 hermes_intake.py entity-add --type person --name "Christer" --alias "christer@..."
+
+  # 7) THE NAME TRIGGER (rule 498125c6, amended 4 Sep 2026, task 215ba9b6):
+  #    `artifact` mechanically scans title+body for a named person. If found:
+  #    - money verb + name, filing is NOT loose_end/loose_ends -> HARD BLOCK.
+  #      Refile with --type loose_end --desk loose_ends instead.
+  #    - name with no money verb, filing is NOT loose_end/loose_ends ->
+  #      BLOCK until you pass --waiting-test-ack '<person>: yes/no - <why>'
+  #      (answer THE WAITING TEST: is someone waiting on you to deliver
+  #      something?).
+  #    - false positive (no person actually named) -> pass
+  #      --name-trigger-override '<one-line reason>' to proceed.
+  #    This is a code gate, not a doctrine reminder — it cannot be skipped by
+  #    an agent forgetting to check the ledger before filing.
 """
 import argparse
 import datetime as dt
@@ -156,12 +170,87 @@ def mark(event_id, status, note):
     return {"ok": bool(res), "id": event_id, "status": status}
 
 
+# ————— NAME TRIGGER (rule 498125c6 amendment, ruled 4 Sep 2026) —————
+# Names are mechanically detectable; the judgement (the Waiting Test) is not.
+# Detection is code, forced at filing time, not a prose reminder an agent can
+# skip. This is the reflex repair for the Uncle Jo miss (task 215ba9b6).
+
+MONEY_VERBS = [
+    "pay", "paid", "paying", "payment", "reimburse", "reimbursement",
+    "owe", "owes", "owed", "transfer", "remit", "settle", "send money",
+    "give money", "refund",
+]
+RELATION_WORDS = [
+    "uncle", "auntie", "aunt", "tito", "tita", "kuya", "ate", "lola",
+    "lolo", "papa", "mama", "mommy", "daddy", "mom", "dad", "sir",
+    "madam", "mr", "mrs", "ms", "dr", "doc",
+]
+# Words that commonly lead a task title in caps but are not names — keeps the
+# proper-noun scan from firing on every title's first content word.
+TITLE_STOPWORDS = {
+    "pay", "send", "reply", "tell", "thank", "return", "introduce",
+    "reimburse", "renew", "book", "follow", "prepare", "draft", "file",
+    "front", "desk", "task", "reminder", "the", "a", "an", "to", "for",
+    "of", "and", "or", "re", "up", "on", "in", "at", "with", "no",
+}
+
+
+def _name_trigger_scan(title, body):
+    """Mechanical only, no judgement. Returns (name_hit, money_hit, matched_via)."""
+    combined = f"{title or ''} {body or ''}"
+    lower = combined.lower()
+    name_hit, matched_via = False, None
+    for w in RELATION_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", lower):
+            name_hit, matched_via = True, f"relation_word:{w}"
+            break
+    if not name_hit:
+        words = (title or "").split()
+        for i, w in enumerate(words):
+            if i == 0:
+                continue
+            core = re.sub(r"[^A-Za-z]", "", w)
+            if core and core[0].isupper() and core.lower() not in TITLE_STOPWORDS:
+                name_hit, matched_via = True, f"capitalized_word:{core}"
+                break
+    money_hit = any(v in lower for v in MONEY_VERBS)
+    return name_hit, money_hit, matched_via
+
+
 # ————— artifacts born from events —————
 
 def artifact(a_type, title, body=None, desk="front_desk", status="new",
-             project=None, source_event=None, metadata=None, links=None, due=None):
+             project=None, source_event=None, metadata=None, links=None, due=None,
+             waiting_test_ack=None, name_trigger_override=None):
+    name_hit, money_hit, matched_via = _name_trigger_scan(title, body)
+    if name_hit and not name_trigger_override:
+        is_loose_end = (a_type == "loose_end" and desk == "loose_ends")
+        if money_hit and not is_loose_end:
+            _die(
+                "NAME TRIGGER (rule 498125c6): money verb + named person detected "
+                f"({matched_via}) in this filing. Per THE WAITING TEST, money moving "
+                "toward a named person is ALWAYS a loose end on their tab -- refile "
+                "with --type loose_end --desk loose_ends (metadata: person, direction, "
+                "settled_when). If this genuinely names no person, pass "
+                "--name-trigger-override '<one-line reason>' to proceed."
+            )
+        elif not is_loose_end and not waiting_test_ack:
+            _die(
+                f"NAME TRIGGER (rule 498125c6): a name was detected ({matched_via}) in "
+                "this filing. Ask THE WAITING TEST out loud -- is someone waiting on "
+                "you to deliver something? -- then pass --waiting-test-ack "
+                "'<person>: yes/no - <one-line reasoning>' to file. If no person is "
+                "actually named, pass --name-trigger-override '<one-line reason>' "
+                "instead."
+            )
     row = {"type": a_type, "title": title, "body": body, "desk": desk,
            "status": status, "metadata": metadata or {}}
+    if waiting_test_ack:
+        row["metadata"] = dict(row["metadata"] or {})
+        row["metadata"]["waiting_test_ack"] = waiting_test_ack
+    if name_trigger_override:
+        row["metadata"] = dict(row["metadata"] or {})
+        row["metadata"]["name_trigger_override"] = name_trigger_override
     if due:
         row["due_at"] = due  # ISO 8601; feeds Today (due 48h) and Inbox (overdue)
     if project:
@@ -268,6 +357,12 @@ def main():
     a.add_argument("--due", help="ISO 8601 deadline, e.g. 2026-07-10T18:00:00+08:00")
     a.add_argument("--link", action="append",
                    help="linked_type:uuid:relationship (e.g. entity:...:mentions)")
+    a.add_argument("--waiting-test-ack",
+                   help="'<person>: yes/no - <reasoning>' -- required when the NAME "
+                        "TRIGGER fires on a non-loose_end filing (rule 498125c6)")
+    a.add_argument("--name-trigger-override",
+                   help="one-line reason the NAME TRIGGER false-positived (no person "
+                        "actually named) -- bypasses the gate")
 
     s = sub.add_parser("search"); s.add_argument("--q", required=True)
     u = sub.add_parser("upload"); u.add_argument("--file", required=True)
@@ -295,7 +390,7 @@ def main():
         out = artifact(args.type, args.title, args.body, args.desk, args.status,
                        args.project, args.source_event,
                        json.loads(args.metadata) if args.metadata else {}, links,
-                       args.due)
+                       args.due, args.waiting_test_ack, args.name_trigger_override)
     elif args.cmd == "search":
         out = search(args.q)
     elif args.cmd == "upload":
